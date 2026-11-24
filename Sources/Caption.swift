@@ -6,7 +6,13 @@ import Translation
 import CoreMedia
 
 private let source = Locale.Language(identifier: "ja")
-private let target = Locale.Language(identifier: "zh-Hans")
+private let defaultTarget = "zh-Hans"
+private let labels = Locale(identifier: "zh-Hans")
+private func languageName(_ id: String) -> String {
+    if id == "zh-Hans" { return "简体中文" }
+    if id == "zh-Hant" { return "繁体中文" }
+    return labels.localizedString(forIdentifier: id) ?? id
+}
 private let sample = "来週の会議は火曜日の午後三時に始まります。"
 private struct Fault: LocalizedError {
     var errorDescription: String?
@@ -32,8 +38,14 @@ private struct Pending {
     @Published var caption = ""
     @Published var history = [Piece]()
     @Published var preparing = false
-    @Published var mode = Mode.mic
-    private var generation = UUID()
+    @Published private(set) var mode = Mode.mic
+    @Published private(set) var aiTranslation = UserDefaults.standard.object(forKey: "aiTranslation") as? Bool ?? true
+    @Published private(set) var targetID = UserDefaults.standard.string(forKey: "targetLanguage") ?? defaultTarget
+    @Published private(set) var targetOptions = [defaultTarget]
+    private(set) var generation = UUID()
+    private var originalTask: Task<Void, Never>?
+
+    init() { targetOptions = [targetID] }
     private var engine: AVAudioEngine?
     private var analyzer: SpeechAnalyzer?
     private var stream: AsyncStream<AnalyzerInput>.Continuation?
@@ -42,7 +54,43 @@ private struct Pending {
     private var draft: Pending?
     private var lastFinalEnd = -1.0
     private var lastPreview = ""
-    private var lastCompleted = ""
+
+    func loadLanguages() async {
+        let service = LanguageAvailability()
+        let languages = await service.supportedLanguages
+        var ids = Set<String>()
+        for language in languages where language.languageCode?.identifier != "ja" {
+            let extended = language.maximalIdentifier
+            let id = extended.hasPrefix("zh-Hans") ? "zh-Hans" : extended.hasPrefix("zh-Hant") ? "zh-Hant" : language.minimalIdentifier
+            if await service.status(from: source, to: .init(identifier: id)) != .unsupported { ids.insert(id) }
+        }
+        guard !ids.isEmpty else { return }
+        targetOptions = ids.sorted { languageName($0).localizedStandardCompare(languageName($1)) == .orderedAscending }
+        if !ids.contains(targetID), let fallback = ids.contains(defaultTarget) ? defaultTarget : targetOptions.first {
+            chooseTarget(fallback)
+        }
+    }
+
+    func chooseAI(_ enabled: Bool) {
+        guard enabled != aiTranslation else { return }
+        resetForSettings()
+        aiTranslation = enabled
+        UserDefaults.standard.set(enabled, forKey: "aiTranslation")
+    }
+
+    func chooseTarget(_ id: String) {
+        guard id != targetID else { return }
+        resetForSettings()
+        targetID = id
+        UserDefaults.standard.set(id, forKey: "targetLanguage")
+    }
+
+    private func resetForSettings() {
+        stop(running ? "设置已更新 · 请重新开始收听或测试样例" : "设置已更新")
+        history.removeAll()
+        transcript = ""
+        caption = ""
+    }
 
     func begin(_ newMode: Mode) {
         stop()
@@ -51,13 +99,21 @@ private struct Pending {
         preparing = true
         caption = ""
         transcript = ""
-        status = "正在准备本机翻译模型…"
-        if config == nil { config = .init(source: source, target: target) }
-        else { config?.invalidate() }
+        let token = generation
+        if aiTranslation {
+            status = "正在准备本机翻译模型…"
+            config = .init(source: source, target: .init(identifier: targetID))
+        } else {
+            status = "正在准备日语原文…"
+            originalTask = Task { await self.run(nil, token: token) }
+        }
     }
 
     func stop(_ message: String = "已停止 · 麦克风关闭") {
         generation = UUID()
+        config = nil
+        originalTask?.cancel()
+        originalTask = nil
         if let engine { engine.stop(); engine.inputNode.removeTap(onBus: 0) }
         engine = nil
         stream?.finish()
@@ -70,7 +126,6 @@ private struct Pending {
         draft = nil
         lastFinalEnd = -1
         lastPreview = ""
-        lastCompleted = ""
         running = false
         preparing = false
         status = message
@@ -80,7 +135,6 @@ private struct Pending {
         if p.final {
             if history.count >= 160 { history.removeFirst(history.count - 159) }
             history.append(Piece(ja: p.text, zh: zh))
-            lastCompleted = zh
         }
         // Don't paint an older result over a more recent displayed interim.
         if !p.final || draft == nil || draft!.end <= p.end {
@@ -96,6 +150,11 @@ private struct Pending {
         let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
         if end.isFinite && end <= lastFinalEnd { return }
         let p = Pending(text: clean, final: final, end: end)
+        if !aiTranslation {
+            if final && end.isFinite { lastFinalEnd = end }
+            publish(clean, for: p)
+            return
+        }
         if final {
             finals.append(p)
             lastFinalEnd = end.isFinite ? end : lastFinalEnd
@@ -150,22 +209,18 @@ private struct Pending {
         try audio.start()
     }
 
-    func run(_ session: TranslationSession) async {
-        guard running else { return }
-        let token = generation
+    func run(_ session: TranslationSession?, token: UUID) async {
+        guard running, generation == token, (session != nil) == aiTranslation else { return }
+        if let session,
+           session.targetLanguage?.maximalIdentifier != Locale.Language(identifier: targetID).maximalIdentifier { return }
         do {
-            try await session.prepareTranslation()
+            if let session { try await session.prepareTranslation() }
             guard generation == token, !Task.isCancelled else { return }
             if mode == .sample {
-                let result = try await session.translate(sample)
+                let translated = try await session?.translate(sample).targetText ?? sample
                 guard generation == token, !Task.isCancelled else { return }
-                publish(result.targetText, for: Pending(text: sample, final: true, end: 0))
-                if ProcessInfo.processInfo.arguments.contains("--sample-test") {
-                    print("CAPTION_TEST_RESULT=" + result.targetText)
-                    fflush(stdout)
-                    NSApp.terminate(nil)
-                }
-                stop("样例翻译完成 · 未使用麦克风")
+                publish(translated, for: Pending(text: sample, final: true, end: 0))
+                stop(session == nil ? "样例完成 · 仅显示日语原文，未使用麦克风" : "样例翻译完成 · 未使用麦克风")
                 return
             }
             status = "等待麦克风权限…"
@@ -182,7 +237,8 @@ private struct Pending {
             } else { throw Fault("这台 Mac 的本机语音模型不支持日语。") }
             guard generation == token, !Task.isCancelled else { return }
             preparing = false
-            status = "正在收听日语 · 不外放"
+            status = aiTranslation ? "正在收听日语 · 本机转译，不外放" : "正在收听日语 · 仅显示原文，不外放"
+            guard let session else { return }
             while generation == token && !Task.isCancelled {
                 let p = !finals.isEmpty ? finals.removeFirst() : draft.flatMap { $0.text == lastPreview ? nil : $0 }
                 if let p {
@@ -198,11 +254,6 @@ private struct Pending {
         } catch {
             guard generation == token, !Task.isCancelled else { return }
             let detail = error.localizedDescription
-            if ProcessInfo.processInfo.arguments.contains("--sample-test") {
-                print("CAPTION_TEST_ERROR=" + detail)
-                fflush(stdout)
-                NSApp.terminate(nil)
-            }
             stop("未能继续：" + detail)
         }
     }
@@ -240,11 +291,12 @@ private struct WindowProxy: NSViewRepresentable {
     @State private var floating = false
     @State private var fontSize: Double = 38
     var body: some View {
+        let token = model.generation
         VStack(alignment: .leading, spacing: 18) {
             HStack {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("实时字幕").font(.system(size: 28, weight: .bold))
-                    Text("日本語  →  简体中文").foregroundStyle(.secondary)
+                    Text(model.aiTranslation ? "日本語  →  " + languageName(model.targetID) : "日本語  ·  仅原文").foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("测试样例") { model.begin(.sample) }.disabled(model.running)
@@ -252,12 +304,20 @@ private struct WindowProxy: NSViewRepresentable {
                     if model.running { model.stop() } else { model.begin(.mic) }
                 }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
             }
+            HStack(spacing: 18) {
+                Toggle("AI 转译", isOn: Binding(get: { model.aiTranslation }, set: { model.chooseAI($0) }))
+                    .toggleStyle(.switch)
+                Picker("输出语言", selection: Binding(get: { model.targetID }, set: { model.chooseTarget($0) })) {
+                    ForEach(model.targetOptions, id: \.self) { id in Text(languageName(id)).tag(id) }
+                }.frame(maxWidth: 270).disabled(!model.aiTranslation)
+                Spacer()
+            }
             VStack(alignment: .leading, spacing: 8) {
-                Text(model.caption.isEmpty ? "中文字幕将在这里显示" : model.caption)
+                Text(model.caption.isEmpty ? (model.aiTranslation ? languageName(model.targetID) + "字幕将在这里显示" : "日语原文将在这里显示") : model.caption)
                     .font(.system(size: fontSize, weight: .semibold))
                     .foregroundStyle(model.caption.isEmpty ? .secondary : .primary)
                     .textSelection(.enabled)
-                if showJapanese && !model.transcript.isEmpty {
+                if model.aiTranslation && showJapanese && !model.transcript.isEmpty {
                     Text(model.transcript).font(.title3).foregroundStyle(.secondary).textSelection(.enabled)
                 }
             }.frame(maxWidth: .infinity, minHeight: 125, alignment: .leading)
@@ -281,14 +341,14 @@ private struct WindowProxy: NSViewRepresentable {
                         ForEach(model.history) { row in
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(row.zh).textSelection(.enabled)
-                                if showJapanese { Text(row.ja).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                                if model.aiTranslation && showJapanese { Text(row.ja).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
                             }.frame(maxWidth: .infinity, alignment: .leading).id(row.id)
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }.onChange(of: model.history.last?.id) { _, id in if let id { proxy.scrollTo(id, anchor: .bottom) } }
             }.frame(minHeight: 75)
             HStack {
-                Toggle("显示日语", isOn: $showJapanese)
+                Toggle("显示日语", isOn: $showJapanese).disabled(!model.aiTranslation)
                 Toggle("窗口置顶", isOn: $floating)
                 Spacer()
                 Text("字号")
@@ -298,11 +358,10 @@ private struct WindowProxy: NSViewRepresentable {
         }
         .padding(22).frame(minWidth: 620, minHeight: 440)
         .background(WindowProxy(floating: floating))
-        .translationTask(model.config) { session in await model.run(session) }
+        .translationTask(model.config) { session in await model.run(session, token: token) }
+        .task { await model.loadLanguages() }
         .onDisappear { model.stop() }
-        .onAppear {
-            if ProcessInfo.processInfo.arguments.contains("--sample-test"), !model.running { model.begin(.sample) }
-        }
+
     }
 }
 
