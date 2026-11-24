@@ -1,38 +1,55 @@
-# Japanese Live Captions for Mac
+# Live Speech Captions for Mac
 
-A small macOS app that turns Japanese speech from the default microphone into live subtitles in a language you choose. It shows text only and never plays back audio.
+A quiet macOS app for live captions. Choose an input language or let local Whisper detect the language. Optionally translate into another language using Apple's on-device translation models. The app shows text only; it never plays back or saves audio.
 
 ## Get started
 
-1. Download `Japanese-Live-Captions-v1.1.0-arm64.zip` from [Releases](https://github.com/SvenKunkka/japanese-live-captions/releases/latest) and extract it.
-2. Open **日语实时字幕**. The release uses an ad hoc code signature and is not notarized, so macOS may block the downloaded copy. If it does, you can build from source on your Mac using the instructions below.
-3. Leave **AI 转译** (AI translation) on and choose **输出语言** (Output language), or switch AI translation off to show only the original Japanese transcription. The app remembers both settings. Available target languages come from the device's supported Apple translation pairs.
-4. Click **测试样例** (Test sample) to try the selected mode without microphone access. macOS may download language models on first use.
-5. Click **开始收听** (Start listening) and grant microphone access. Click **停止** (Stop) or close the window to stop listening.
+1. Download `Live-Speech-Captions-v1.2.0-arm64.zip` from [Releases](https://github.com/SvenKunkka/japanese-live-captions/releases/latest) and extract it. The app is listed as **日语实时字幕** for compatibility with existing installations; the window is titled **实时语音字幕**.
+2. Choose **输入语言** (Input language). Manual mode lists the speech locales supported by Apple on this Mac. To use automatic detection, choose **自动识别（Whisper）** after completing the one-time setup below.
+3. Leave **AI 转译** (AI translation) on and choose **输出语言** (Output language), or switch it off to show only the original transcription. These settings are remembered.
+4. Click **开始收听** (Start listening) and grant microphone access. Click **停止** (Stop) or close the window to stop listening. In supported manual modes, **测试样例** (Test sample) checks text output without using the microphone.
 
-Requires **macOS 26 or later** on an **Apple Silicon Mac**. The interface is in Simplified Chinese. You can toggle the Japanese transcript, keep the window on top, and change subtitle size. If you change the mode or output language during a session, the app stops listening and clears earlier subtitles. Click **开始收听** again to resume.
+Requires **macOS 26 or later** and an **Apple Silicon Mac**. The interface is in Simplified Chinese. The release is ad hoc signed and not Apple-notarized; if macOS blocks the downloaded app, build it from source instead.
 
-## Privacy and verification
+## Optional automatic detection
 
-Japanese recognition and translation use Apple's on-device models. An internet connection may be needed to download those models on first use. The app does not save recordings, upload conversation audio, or require an API key. Subtitle history is kept in memory while the app is open.
+Manual mode does not need Whisper. Automatic mode uses the Homebrew `openai-whisper` package and the official multilingual Tiny model. Install it from Homebrew, then fetch and verify the model once:
 
-The bundled Japanese text sample was verified on a real Mac both with Simplified Chinese translation and with translation off (Japanese only), without enabling the microphone. Live microphone capture was not tested in this release.
+```sh
+brew install openai-whisper
+cache="$HOME/.cache/whisper"
+mkdir -p "$cache"
+model_tmp="$(mktemp "$cache/.tiny.XXXXXX")"
+curl -fL -o "$model_tmp" https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt &&
+printf '%s  %s\n' 65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9 "$model_tmp" | shasum -a 256 -c - &&
+mv "$model_tmp" "$cache/tiny.pt"
+```
+
+Automatic mode processes speech in roughly five-second windows. Accuracy varies by language, dialect, speech length and background noise. It does not promise coverage for every language or reliable word-by-word language switching. If Apple cannot translate the detected language into the chosen target, the app shows the original text. In a noisy room or when you know which language is being spoken, try manual mode.
+
+## Privacy
+
+Manual recognition and optional translation use Apple models. Automatic recognition uses the local Whisper process. Audio passes to Whisper in memory and is not sent to a cloud service. Short-lived subtitle history exists only while the app is open. You may need Internet access to download the relevant models; no API key is required.
+
+Changing source, target, or AI translation mode stops the current session and clears earlier subtitles. Click **开始收听** to resume.
 
 ## Build from source
 
 With the macOS 26 SDK and Swift 6.2 or newer:
 
 ```sh
-mkdir -p '日语实时字幕.app/Contents/MacOS'
-cp Sources/Info.plist '日语实时字幕.app/Contents/Info.plist'
+app='日语实时字幕.app'
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp Sources/Info.plist "$app/Contents/"
+cp Sources/whisper_bridge.py "$app/Contents/Resources/"
 xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macos26.0 \
-  Sources/Caption.swift -o '日语实时字幕.app/Contents/MacOS/LiveCaption'
-codesign --force --sign - '日语实时字幕.app'
-codesign --verify --strict '日语实时字幕.app'
+  Sources/Caption.swift -o "$app/Contents/MacOS/LiveCaption"
+codesign --force --sign - "$app"
+codesign --verify --strict "$app"
 ```
+
+Automatic detection uses [OpenAI Whisper](https://github.com/openai/whisper) as a separately installed dependency. Neither Whisper software nor its model weights are bundled in this release. No license has been granted for this repository.
 
 ## 中文速用
 
-macOS 26 或以上、Apple 芯片。打开「日语实时字幕」后，可选择输出语言。关闭「AI 转译」则仅显示日语原文。先点「测试样例」，再点「开始收听」并允许麦克风权限。字幕只显示文字，不外放；首次可能需要联网下载苹果语言模型。
-
-No license has been granted for this repository.
+在「输入语言」选择需要识别的语种，或者完成上面的本机 Whisper 安装后选择「自动识别（Whisper）」。关闭「AI 转译」会只显示识别到的原文；打开则可选择输出语言。自动识别约每五秒刷新，语言覆盖以模型为准，不支持的转译组合会显示原文。

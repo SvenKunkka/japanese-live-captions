@@ -4,16 +4,39 @@ import AppKit
 import Speech
 import Translation
 import CoreMedia
+import Darwin
 
-private let source = Locale.Language(identifier: "ja")
+private let defaultSource = "ja-JP"
+private let autoSource = "auto"
 private let defaultTarget = "zh-Hans"
 private let labels = Locale(identifier: "zh-Hans")
 private func languageName(_ id: String) -> String {
+    if id == autoSource { return "自动识别（Whisper）" }
     if id == "zh-Hans" { return "简体中文" }
     if id == "zh-Hant" { return "繁体中文" }
     return labels.localizedString(forIdentifier: id) ?? id
 }
-private let sample = "来週の会議は火曜日の午後三時に始まります。"
+private let samples: [String: String] = [
+    "ja": "来週の会議は火曜日の午後三時に始まります。",
+    "en": "Next week’s meeting starts at three on Tuesday afternoon.",
+    "zh": "下周的会议在周二下午三点开始。",
+    "fr": "La réunion de la semaine prochaine commence mardi à quinze heures.",
+    "de": "Das Treffen nächste Woche beginnt am Dienstag um fünfzehn Uhr.",
+    "es": "La reunión de la próxima semana empieza el martes a las tres de la tarde.",
+    "it": "La riunione della prossima settimana inizia martedì alle tre del pomeriggio.",
+    "pt": "A reunião da próxima semana começa na terça-feira às três da tarde.",
+    "ko": "다음 주 회의는 화요일 오후 세 시에 시작합니다。",
+    "ru": "Встреча на следующей неделе начнётся во вторник в три часа дня。",
+    "tr": "Gelecek haftaki toplantı salı günü öğleden sonra saat üçte başlayacak.",
+    "vi": "Cuộc họp tuần sau bắt đầu lúc ba giờ chiều thứ Ba.",
+    "id": "Rapat minggu depan dimulai pada hari Selasa pukul tiga sore.",
+    "nl": "De vergadering van volgende week begint dinsdag om drie uur 's middags.",
+    "uk": "Зустріч наступного тижня розпочнеться у вівторок о третій годині дня.",
+    "th": "การประชุมสัปดาห์หน้าเริ่มวันอังคารตอนบ่ายสามโมง",
+    "hi": "अगले सप्ताह की बैठक मंगलवार दोपहर तीन बजे शुरू होगी।",
+    "ar": "يبدأ اجتماع الأسبوع المقبل يوم الثلاثاء الساعة الثالثة بعد الظهر.",
+    "pl": "Spotkanie w przyszłym tygodniu zaczyna się we wtorek o piętnastej."
+]
 private struct Fault: LocalizedError {
     var errorDescription: String?
     init(_ message: String) { errorDescription = message }
@@ -42,10 +65,22 @@ private struct Pending {
     @Published private(set) var aiTranslation = UserDefaults.standard.object(forKey: "aiTranslation") as? Bool ?? true
     @Published private(set) var targetID = UserDefaults.standard.string(forKey: "targetLanguage") ?? defaultTarget
     @Published private(set) var targetOptions = [defaultTarget]
+    @Published private(set) var sourceID = UserDefaults.standard.string(forKey: "sourceLanguage") ?? defaultSource
+    @Published private(set) var sourceOptions = [defaultSource]
+    @Published private(set) var loadingTargets = true
+    @Published private(set) var autoLanguage: String?
+    private var worker: Process?
+    private var workerWriter: Task<Void, Never>?
+    private var speechEnd = 0.0
+    private(set) var autoEpoch = UUID()
+    private var rejectedAutoLanguage: String?
+    private var autoSessionLanguage: Locale.Language?
+    private var source: Locale.Language { Locale.Language(identifier: sourceID) }
+    var sampleAvailable: Bool { sourceID != autoSource && source.languageCode.flatMap { samples[$0.identifier] } != nil }
     private(set) var generation = UUID()
     private var originalTask: Task<Void, Never>?
 
-    init() { targetOptions = [targetID] }
+    init() { targetOptions = [targetID]; sourceOptions = [sourceID] }
     private var engine: AVAudioEngine?
     private var analyzer: SpeechAnalyzer?
     private var stream: AsyncStream<AnalyzerInput>.Continuation?
@@ -55,20 +90,43 @@ private struct Pending {
     private var lastFinalEnd = -1.0
     private var lastPreview = ""
 
-    func loadLanguages() async {
+    func loadSources() async {
+        let speech = await SpeechTranscriber.supportedLocales
+        let dictation = await DictationTranscriber.supportedLocales
+        let ids = Set((speech + dictation).map { $0.identifier(.bcp47) })
+        guard !Task.isCancelled, !ids.isEmpty else { return }
+        sourceOptions = [autoSource] + ids.sorted { languageName($0).localizedStandardCompare(languageName($1)) == .orderedAscending }
+        if sourceID != autoSource, !ids.contains(sourceID), let fallback = ids.contains(defaultSource) ? defaultSource : sourceOptions.first {
+            chooseSource(fallback)
+        }
+    }
+
+    func loadTargets(for input: String) async {
         let service = LanguageAvailability()
+        let inputLanguage = Locale.Language(identifier: input)
         let languages = await service.supportedLanguages
         var ids = Set<String>()
-        for language in languages where language.languageCode?.identifier != "ja" {
+        for language in languages where language.languageCode != inputLanguage.languageCode {
             let extended = language.maximalIdentifier
             let id = extended.hasPrefix("zh-Hans") ? "zh-Hans" : extended.hasPrefix("zh-Hant") ? "zh-Hant" : language.minimalIdentifier
-            if await service.status(from: source, to: .init(identifier: id)) != .unsupported { ids.insert(id) }
+            if input == autoSource { ids.insert(id) }
+            else if await service.status(from: inputLanguage, to: .init(identifier: id)) != .unsupported { ids.insert(id) }
         }
-        guard !ids.isEmpty else { return }
+        guard !Task.isCancelled, sourceID == input else { return }
+        loadingTargets = false
         targetOptions = ids.sorted { languageName($0).localizedStandardCompare(languageName($1)) == .orderedAscending }
         if !ids.contains(targetID), let fallback = ids.contains(defaultTarget) ? defaultTarget : targetOptions.first {
-            chooseTarget(fallback)
+            targetID = fallback
         }
+    }
+
+    func chooseSource(_ id: String) {
+        guard id != sourceID else { return }
+        resetForSettings()
+        loadingTargets = true
+        targetOptions = []
+        sourceID = id
+        UserDefaults.standard.set(id, forKey: "sourceLanguage")
     }
 
     func chooseAI(_ enabled: Bool) {
@@ -100,11 +158,19 @@ private struct Pending {
         caption = ""
         transcript = ""
         let token = generation
+        if sourceID == autoSource && newMode == .mic {
+            originalTask = Task { await self.startAutomatic(token) }
+            return
+        }
         if aiTranslation {
+            guard targetOptions.contains(targetID), !loadingTargets else {
+                stop("所选输入语言没有可用的转译目标，或仍在查询。可关闭 AI 转译，仅显示原文。")
+                return
+            }
             status = "正在准备本机翻译模型…"
             config = .init(source: source, target: .init(identifier: targetID))
         } else {
-            status = "正在准备日语原文…"
+            status = "正在准备识别原文…"
             originalTask = Task { await self.run(nil, token: token) }
         }
     }
@@ -114,6 +180,16 @@ private struct Pending {
         config = nil
         originalTask?.cancel()
         originalTask = nil
+        if let worker, worker.isRunning { worker.terminate() }
+        worker = nil
+        // The writer task owns its pipe handle and closes it after input ends.
+        workerWriter?.cancel()
+        workerWriter = nil
+        autoLanguage = nil
+        autoSessionLanguage = nil
+        rejectedAutoLanguage = nil
+        autoEpoch = UUID()
+        speechEnd = 0
         if let engine { engine.stop(); engine.inputNode.removeTap(onBus: 0) }
         engine = nil
         stream?.finish()
@@ -168,12 +244,12 @@ private struct Pending {
 
     private func setup<M: SpeechModule>(_ transcriber: M, token: UUID, extract: @escaping (M.Result) -> String) async throws {
         if await AssetInventory.status(forModules: [transcriber]) != .installed {
-            status = "正在下载苹果日语语音模型…"
+            status = "正在下载苹果语音模型…"
             if let install = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
                 try await install.downloadAndInstall()
             }
             guard await AssetInventory.status(forModules: [transcriber]) == .installed else {
-                throw Fault("日语语音模型未安装，请联网后重试。")
+                throw Fault("所选语音模型未安装，请联网后重试。")
             }
         }
         guard generation == token, !Task.isCancelled else { throw CancellationError() }
@@ -209,18 +285,173 @@ private struct Pending {
         try audio.start()
     }
 
-    func run(_ session: TranslationSession?, token: UUID) async {
+    private func startAutomatic(_ token: UUID) async {
+        do {
+            let python = "/opt/homebrew/opt/openai-whisper/libexec/bin/python"
+            let model = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/whisper/tiny.pt")
+            guard FileManager.default.isExecutableFile(atPath: python), FileManager.default.fileExists(atPath: model.path),
+                  let bridge = Bundle.main.url(forResource: "whisper_bridge", withExtension: "py") else {
+                throw Fault("自动识别需要本机 Whisper 和多语言 tiny 模型。请参照 GitHub 安装说明，或手动选择输入语言。")
+            }
+            status = "等待麦克风权限…"
+            let allowed = await AVCaptureDevice.requestAccess(for: .audio)
+            guard generation == token, !Task.isCancelled else { return }
+            guard allowed else { throw Fault("请在系统设置中允许本应用使用麦克风。") }
+            let audio = AVAudioEngine()
+            let node = audio.inputNode
+            let incoming = node.outputFormat(forBus: 0)
+            guard incoming.sampleRate > 0, incoming.channelCount > 0,
+                  let output = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)
+            else { throw Fault("找不到可用的麦克风。") }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: python)
+            process.arguments = ["-u", bridge.path, model.path]
+            let input = Pipe(), outputPipe = Pipe()
+            process.standardInput = input
+            process.standardOutput = outputPipe
+            process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, self.generation == token else { return }
+                    self.stop("自动识别已结束，可重试或手动选择输入语言。")
+                }
+            }
+            let reader = outputPipe.fileHandleForReading
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                var pending = Data()
+                while true {
+                    let chunk = reader.availableData
+                    if chunk.isEmpty { break }
+                    pending.append(chunk)
+                    if pending.count > 1_000_000 { break }
+                    while let newline = pending.firstIndex(of: 10) {
+                        let line = Data(pending[..<newline])
+                        pending.removeSubrange(...newline)
+                        guard let event = try? JSONDecoder().decode(WhisperEvent.self, from: line) else { continue }
+                        Task { @MainActor in
+                            await self?.handleAutomatic(event, token: token)
+                        }
+                    }
+                }
+            }
+            try process.run()
+            worker = process
+            let writer = input.fileHandleForWriting
+            _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+            let (sequence, sender) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .bufferingNewest(150))
+            stream = sender
+            workerWriter = Task.detached(priority: .userInitiated) {
+                defer { try? writer.close() }
+                for await packet in sequence {
+                    if Task.isCancelled { break }
+                    guard let floats = packet.buffer.floatChannelData?[0] else { continue }
+                    let bytes = Data(bytes: floats, count: Int(packet.buffer.frameLength) * MemoryLayout<Float>.size)
+                    do { try writer.write(contentsOf: bytes) } catch { break }
+                }
+            }
+            try installMicrophoneTap(on: node, input: incoming, output: output, sender: sender)
+            engine = audio
+            audio.prepare()
+            try audio.start()
+            status = "正在启动本机自动识别…"
+        } catch {
+            guard generation == token, !Task.isCancelled else { return }
+            stop("未能继续：" + error.localizedDescription)
+        }
+    }
+
+    private func handleAutomatic(_ event: WhisperEvent, token: UUID) async {
+        guard generation == token, running else { return }
+        if let error = event.error { stop("自动识别失败：" + error); return }
+        if event.ready == true {
+            preparing = false
+            status = "自动识别中 · 每约 5 秒更新，不外放"
+            return
+        }
+        guard let language = event.language, let text = event.text, !text.isEmpty else { return }
+        if language != autoLanguage {
+            autoEpoch = UUID()
+            autoLanguage = language
+            rejectedAutoLanguage = nil
+            autoSessionLanguage = nil
+            finals.removeAll()
+            config = nil
+            caption = ""
+        }
+        speechEnd += 1
+        let p = Pending(text: text, final: true, end: speechEnd)
+        transcript = text
+        guard aiTranslation else { publish(text, for: p); return }
+        if let rejected = rejectedAutoLanguage, rejected == language { publish(text, for: p); return }
+        finals.append(p)
+        if finals.count > 20 { finals.removeFirst(finals.count - 20) }
+        if autoSessionLanguage != nil { return }
+        let epoch = autoEpoch
+        let input = Locale.Language(identifier: language)
+        let output = Locale.Language(identifier: targetID)
+        let support = await LanguageAvailability().status(from: input, to: output)
+        guard generation == token, autoEpoch == epoch, autoSessionLanguage == nil, rejectedAutoLanguage == nil else { return }
+        if input.languageCode == output.languageCode || support == .unsupported {
+            rejectedAutoLanguage = language
+            status = "已识别为" + languageName(language) + " · 不支持该语言组合，显示原文"
+            let queued = finals
+            finals.removeAll()
+            for item in queued { publish(item.text, for: item) }
+            return
+        }
+        autoSessionLanguage = input
+        status = "已识别为" + languageName(language) + " · 正在准备翻译模型"
+        config = .init(source: input, target: output)
+    }
+
+    private func runAutomaticTranslation(_ session: TranslationSession, token: UUID, epoch: UUID) async {
+        guard generation == token, autoEpoch == epoch, let language = autoLanguage, let expected = autoSessionLanguage,
+              session.sourceLanguage?.languageCode == expected.languageCode else { return }
+        do {
+            try await session.prepareTranslation()
+            guard generation == token, epoch == autoEpoch, !Task.isCancelled else { return }
+            status = "自动识别 · " + languageName(language) + " → " + languageName(targetID) + " · 不外放"
+            while generation == token && epoch == autoEpoch && !Task.isCancelled {
+                if let p = finals.first {
+                    finals.removeFirst()
+                    do {
+                        let response = try await session.translate(p.text)
+                        guard generation == token, epoch == autoEpoch, !Task.isCancelled else { return }
+                        publish(response.targetText, for: p)
+                    } catch {
+                        guard generation == token, epoch == autoEpoch, !Task.isCancelled else { return }
+                        publish(p.text, for: p)
+                        throw error
+                    }
+                }
+                try await Task.sleep(for: .milliseconds(90))
+            }
+        } catch {
+            guard generation == token, epoch == autoEpoch, !Task.isCancelled else { return }
+            rejectedAutoLanguage = language
+            status = "无法准备所选翻译模型 · 暂显示原文"
+            let queued = finals
+            finals.removeAll()
+            for item in queued { publish(item.text, for: item) }
+        }
+    }
+
+    func run(_ session: TranslationSession?, token: UUID, epoch: UUID? = nil) async {
+        if sourceID == autoSource, let session, let epoch { await runAutomaticTranslation(session, token: token, epoch: epoch); return }
         guard running, generation == token, (session != nil) == aiTranslation else { return }
         if let session,
-           session.targetLanguage?.maximalIdentifier != Locale.Language(identifier: targetID).maximalIdentifier { return }
+           (session.targetLanguage?.maximalIdentifier != Locale.Language(identifier: targetID).maximalIdentifier ||
+            session.sourceLanguage?.languageCode != source.languageCode) { return }
         do {
             if let session { try await session.prepareTranslation() }
             guard generation == token, !Task.isCancelled else { return }
             if mode == .sample {
+                guard let code = source.languageCode?.identifier, var sample = samples[code] else { throw Fault("此输入语言尚无内置样例。") }
+                if source.maximalIdentifier.hasPrefix("zh-Hant") { sample = "下週的會議在週二下午三點開始。" }
                 let translated = try await session?.translate(sample).targetText ?? sample
                 guard generation == token, !Task.isCancelled else { return }
                 publish(translated, for: Pending(text: sample, final: true, end: 0))
-                stop(session == nil ? "样例完成 · 仅显示日语原文，未使用麦克风" : "样例翻译完成 · 未使用麦克风")
+                stop(session == nil ? "样例完成 · 仅显示原文，未使用麦克风" : "样例翻译完成 · 未使用麦克风")
                 return
             }
             status = "等待麦克风权限…"
@@ -229,15 +460,15 @@ private struct Pending {
             guard permission else {
                 throw Fault("麦克风权限未开启。请到 系统设置 → 隐私与安全性 → 麦克风，允许本应用后重试。")
             }
-            let japanese = Locale(identifier: "ja-JP")
-            if let locale = await SpeechTranscriber.supportedLocale(equivalentTo: japanese) {
+            let input = Locale(identifier: sourceID)
+            if let locale = await SpeechTranscriber.supportedLocale(equivalentTo: input) {
                 try await setup(SpeechTranscriber(locale: locale, preset: .progressiveTranscription), token: token) { String($0.text.characters) }
-            } else if let locale = await DictationTranscriber.supportedLocale(equivalentTo: japanese) {
+            } else if let locale = await DictationTranscriber.supportedLocale(equivalentTo: input) {
                 try await setup(DictationTranscriber(locale: locale, preset: .progressiveLongDictation), token: token) { String($0.text.characters) }
-            } else { throw Fault("这台 Mac 的本机语音模型不支持日语。") }
+            } else { throw Fault("这台 Mac 的本机语音模型不支持所选输入语言。") }
             guard generation == token, !Task.isCancelled else { return }
             preparing = false
-            status = aiTranslation ? "正在收听日语 · 本机转译，不外放" : "正在收听日语 · 仅显示原文，不外放"
+            status = aiTranslation ? "正在收听所选语言 · 本机转译，不外放" : "正在收听所选语言 · 仅显示原文，不外放"
             guard let session else { return }
             while generation == token && !Task.isCancelled {
                 let p = !finals.isEmpty ? finals.removeFirst() : draft.flatMap { $0.text == lastPreview ? nil : $0 }
@@ -277,6 +508,13 @@ private func installMicrophoneTap(on node: AVAudioInputNode, input: AVAudioForma
     }
 }
 
+private struct WhisperEvent: Decodable, Sendable {
+    let ready: Bool?
+    let language: String?
+    let text: String?
+    let error: String?
+}
+
 private struct WindowProxy: NSViewRepresentable {
     var floating: Bool
     func makeNSView(context: Context) -> NSView { NSView() }
@@ -292,28 +530,33 @@ private struct WindowProxy: NSViewRepresentable {
     @State private var fontSize: Double = 38
     var body: some View {
         let token = model.generation
+        let epoch = model.autoEpoch
         VStack(alignment: .leading, spacing: 18) {
             HStack {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("实时字幕").font(.system(size: 28, weight: .bold))
-                    Text(model.aiTranslation ? "日本語  →  " + languageName(model.targetID) : "日本語  ·  仅原文").foregroundStyle(.secondary)
+                    Text((model.autoLanguage.map(languageName) ?? languageName(model.sourceID)) + (model.aiTranslation ? "  →  " + (model.targetOptions.isEmpty ? "选择输出语言" : languageName(model.targetID)) : "  ·  仅原文")).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("测试样例") { model.begin(.sample) }.disabled(model.running)
+                Button("测试样例") { model.begin(.sample) }.disabled(model.running || !model.sampleAvailable || (model.aiTranslation && model.loadingTargets))
                 Button(model.running ? "停止" : "开始收听") {
                     if model.running { model.stop() } else { model.begin(.mic) }
                 }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
             }
-            HStack(spacing: 18) {
+            HStack(spacing: 14) {
+                Picker("输入语言", selection: Binding(get: { model.sourceID }, set: { model.chooseSource($0) })) {
+                    ForEach(model.sourceOptions, id: \.self) { id in Text(languageName(id)).tag(id) }
+                }.frame(maxWidth: 265)
                 Toggle("AI 转译", isOn: Binding(get: { model.aiTranslation }, set: { model.chooseAI($0) }))
                     .toggleStyle(.switch)
                 Picker("输出语言", selection: Binding(get: { model.targetID }, set: { model.chooseTarget($0) })) {
+                    if model.targetOptions.isEmpty { Text(model.loadingTargets ? "正在查询…" : "无支持目标").tag(model.targetID) }
                     ForEach(model.targetOptions, id: \.self) { id in Text(languageName(id)).tag(id) }
-                }.frame(maxWidth: 270).disabled(!model.aiTranslation)
+                }.frame(maxWidth: 265).disabled(!model.aiTranslation || model.targetOptions.isEmpty)
                 Spacer()
             }
             VStack(alignment: .leading, spacing: 8) {
-                Text(model.caption.isEmpty ? (model.aiTranslation ? languageName(model.targetID) + "字幕将在这里显示" : "日语原文将在这里显示") : model.caption)
+                Text(model.caption.isEmpty ? (model.aiTranslation ? languageName(model.targetID) + "字幕将在这里显示" : "原文将在这里显示") : model.caption)
                     .font(.system(size: fontSize, weight: .semibold))
                     .foregroundStyle(model.caption.isEmpty ? .secondary : .primary)
                     .textSelection(.enabled)
@@ -348,18 +591,19 @@ private struct WindowProxy: NSViewRepresentable {
                 }.onChange(of: model.history.last?.id) { _, id in if let id { proxy.scrollTo(id, anchor: .bottom) } }
             }.frame(minHeight: 75)
             HStack {
-                Toggle("显示日语", isOn: $showJapanese).disabled(!model.aiTranslation)
+                Toggle("显示原文", isOn: $showJapanese).disabled(!model.aiTranslation)
                 Toggle("窗口置顶", isOn: $floating)
                 Spacer()
                 Text("字号")
                 Slider(value: $fontSize, in: 24...58).frame(width: 95).accessibilityLabel("字幕字号")
             }
-            Text("本机处理 · 不保存录音 · 首次使用可能需要下载苹果语言模型").font(.caption).foregroundStyle(.secondary)
+            Text("本机处理 · 不保存录音 · 自动识别需 Whisper；手动模式使用苹果模型").font(.caption).foregroundStyle(.secondary)
         }
         .padding(22).frame(minWidth: 620, minHeight: 440)
         .background(WindowProxy(floating: floating))
-        .translationTask(model.config) { session in await model.run(session, token: token) }
-        .task { await model.loadLanguages() }
+        .translationTask(model.config) { session in await model.run(session, token: token, epoch: epoch) }
+        .task { await model.loadSources() }
+        .task(id: model.sourceID) { await model.loadTargets(for: model.sourceID) }
         .onDisappear { model.stop() }
 
     }
@@ -367,7 +611,7 @@ private struct WindowProxy: NSViewRepresentable {
 
 @main struct LiveCaptionApp: App {
     var body: some Scene {
-        Window("日语实时字幕", id: "captions") { CaptionView() }
+        Window("实时语音字幕", id: "captions") { CaptionView() }
             .defaultSize(width: 790, height: 525)
     }
 }

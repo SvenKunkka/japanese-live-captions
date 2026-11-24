@@ -3,3 +3,6 @@
 *.app/
 *.zip
 .build/
+
+__pycache__/
+*.pyc
